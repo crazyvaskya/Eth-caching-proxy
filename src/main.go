@@ -32,6 +32,7 @@ func (p *ProxyCache) Get(block, txHash string) string {
 		delete(p.usageIndexMap, tx.usageIndex)
 		tx.usageIndex = p.usageIndex
 		p.usageIndexMap[tx.usageIndex] = txHash
+		p.txMap[txHash] = tx
 		p.usageIndex++
 		return tx.tx
 	}
