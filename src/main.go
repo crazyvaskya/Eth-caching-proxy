@@ -18,8 +18,8 @@ type Transaction struct {
 type ProxyCache struct {
 	maxTxs        uint
 	cachedTxs     uint
-	maxSize       uint
-	cachedSize    uint
+	maxSize       uint // in bytes
+	cachedSize    uint // in bytes
 	txMap         map[string] /*hash*/ Transaction
 	usageIndexMap map[uint]string
 	usageIndex    uint
@@ -27,7 +27,55 @@ type ProxyCache struct {
 
 func (p *ProxyCache) Get(block, txHash string) string {
 	fmt.Println("We should get block", block, "transaction", txHash)
-	return ""
+	tx, txCached := p.txMap[txHash]
+	if txCached {
+		delete(p.usageIndexMap, tx.usageIndex)
+		tx.usageIndex = p.usageIndex
+		p.usageIndexMap[tx.usageIndex] = txHash
+		p.usageIndex++
+		return tx.tx
+	}
+	if p.maxTxs > 0 && uint(len(p.txMap)) == p.maxTxs {
+		p.removeLessUsedTx()
+	}
+	testTx := "This is my test Tx with hash " + txHash
+	for p.maxSize > 0 && (p.cachedSize+uint(len(testTx)) > p.maxSize) {
+		p.removeLessUsedTx()
+	}
+	p.addTx(txHash, testTx)
+	return testTx
+}
+
+func (p *ProxyCache) addTx(txHash, tx string) {
+	if (p.maxSize > 0 && uint(len(tx))+p.cachedSize > p.maxSize) || (p.maxTxs > 0 && p.cachedTxs >= p.maxTxs) {
+		fmt.Println("Max cache size reached, ignoring adding", tx)
+		return
+	}
+	p.usageIndexMap[p.usageIndex] = txHash
+	p.txMap[txHash] = Transaction{
+		p.usageIndex,
+		tx,
+	}
+	p.cachedSize += uint(len(tx))
+	p.cachedTxs++
+	p.usageIndex++
+}
+
+func (p *ProxyCache) removeLessUsedTx() {
+	if p.cachedTxs == 0 {
+		return
+	}
+	minKey := ^uint(0)
+	// TODO: try to optimize later
+	for key := range p.usageIndexMap {
+		if key < minKey {
+			minKey = key
+		}
+	}
+	p.cachedSize -= uint(len(p.txMap[p.usageIndexMap[minKey]].tx))
+	p.cachedTxs--
+	delete(p.txMap, p.usageIndexMap[minKey])
+	delete(p.usageIndexMap, minKey)
 }
 
 func (p ProxyCache) printCache() {
@@ -54,7 +102,7 @@ func (p *ProxyCache) parseInput(input string) (keepHandling bool) {
 			fmt.Println("received incorrect input:", parsedCommand, " usage: /block/<>/tx/<>")
 			return
 		}
-		p.Get(parsedCommand[1], parsedCommand[3])
+		fmt.Println(p.Get(parsedCommand[1], parsedCommand[3]))
 	case PrintCache:
 		p.printCache()
 	default:
@@ -77,7 +125,7 @@ func main() {
 	proxyCache := ProxyCache{
 		*maxCachedTxsPtr,
 		0,
-		*maxCacheSizePtr,
+		*maxCacheSizePtr * 1024,
 		0,
 		map[string]Transaction{},
 		map[uint]string{},
