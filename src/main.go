@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
 )
 
 const PrintCache = "PRINTCACHE"
-const getBlockByNumber = "eth_getBlockByNumber"
-const getTxByHash = "eth_getTransactionByHash"
+const GetBlockByNumber = "eth_getBlockByNumber"
+const GetTxByHash = "eth_getTransactionByHash"
+const MinHashLen = 27
 
 type Printer func(...string)
 
@@ -38,8 +40,12 @@ func (tx TransactionStructure) getTransactionIndex() string {
 	return tx["transactionIndex"].(string)
 }
 
+func (tx TransactionStructure) getBlockNum() string {
+	return tx["blockNumber"].(string)
+}
+
 func (tx TransactionStructure) getBlockNumTransactionIndexKey() string {
-	return tx["blockNumber"].(string) + "-" + tx.getTransactionIndex()
+	return tx.getBlockNum() + "-" + tx.getTransactionIndex()
 }
 
 type Payload struct {
@@ -69,20 +75,20 @@ type ProxyCache struct {
 
 func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (TransactionStructure, error) {
 	res := TransactionStructure{}
-	var method, hash string
-	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending"
+	var method string
+	var params []interface{}
+	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending" || len(txCode) < MinHashLen
 	if callByBlockNumber {
-		method = getBlockByNumber
-		hash = blockNum
+		method = GetBlockByNumber
+		params = []interface{}{blockNum, true}
 	} else {
-		// TODO switch to getTxByHash, txCode
-		method = getBlockByNumber
-		hash = blockNum
+		method = GetTxByHash
+		params = []interface{}{txCode}
 	}
 	data := Payload{
 		"2.0",
 		method,
-		[]interface{}{hash, true},
+		params,
 		1,
 	}
 	payloadBytes, err := json.Marshal(data)
@@ -117,41 +123,64 @@ func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (Transact
 		return res, fmt.Errorf("%s", "Response does not contain \"result\" field")
 	}
 	if callByBlockNumber {
-		return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
+		return p.getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
 	} else {
-		return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
-		//return checkTransaction(blockNum, result["result"].(TransactionStructure))
+		//return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
+		if resultBody == nil {
+			return TransactionStructure{}, fmt.Errorf("%s %s %s", "Transaction", txCode, "does not exist")
+		}
+		return p.checkTransaction(blockNum, resultBody.(map[string]interface{}))
 	}
 
 }
 
-func getTransactionFromBlock(block BlockStructure, txCode string) (TransactionStructure, error) {
+func (p ProxyCache) getTransactionFromBlock(block BlockStructure, txCode string) (TransactionStructure, error) {
 	transactions := block.getTransactions()
+	if len(txCode) < MinHashLen {
+		txIndex := new(big.Int)
+		txIndex.SetString(txCode, 0)
+		if txIndex.IsInt64() && txIndex.Int64() < int64(len(transactions)) {
+			tx := TransactionStructure(transactions[txIndex.Int64()].(map[string]interface{}))
+			if tx.getTransactionIndex() == txCode {
+				p.debugPrinter("Got transaction from block by index")
+				return tx, nil
+			}
+		}
+		// else we give a chance to txCode be a txHash, so check it via loop
+	}
 	for _, transaction := range transactions {
 		tx := TransactionStructure(transaction.(map[string]interface{}))
-		if tx.getHash() == txCode /*|| tx.getTransactionIndex() == txCode*/ {
+		if tx.getHash() == txCode || tx.getTransactionIndex() == txCode {
 			return tx, nil
 		}
 	}
 	return TransactionStructure{}, fmt.Errorf("%s %s", "Transaction not found in the block", block.getNumber())
 }
 
-func checkTransaction(blockNum string, tx TransactionStructure) (TransactionStructure, error) {
-	if tx["blockNumber"] == blockNum {
+func (p ProxyCache) checkTransaction(blockNum string, tx TransactionStructure) (TransactionStructure, error) {
+	if tx.getBlockNum() == blockNum {
+		p.debugPrinter("Transaction belongs to block", blockNum)
 		return tx, nil
 	}
-	return TransactionStructure{}, fmt.Errorf("transaction %v does not belong to blockNumber %s", tx, blockNum)
+	return TransactionStructure{}, fmt.Errorf("transaction %s does not belong to blockNumber %s", tx.getHash(), blockNum)
 }
 
 func (p *ProxyCache) Get(block, txCode string) string {
 	p.debugPrinter("We should get block", block, "transaction", txCode)
-	tx, txCached := p.txMap[txCode]
+	txHashIsArgument := len(txCode) >= MinHashLen
+	var txMapKey string
+	if txHashIsArgument {
+		txMapKey = txCode
+	} else { // argument is index
+		txMapKey = block + "-" + txCode
+	}
+	tx, txCached := p.txMap[txMapKey]
 	if txCached {
 		p.debugPrinter("Moving tx", fmt.Sprintf("%v", tx.tx), "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
 			"to usageIndex", fmt.Sprintf("%d", p.usageIndex))
 		delete(p.usageIndexMap, tx.usageIndex)
 		tx.usageIndex = p.usageIndex
-		p.usageIndexMap[tx.usageIndex] = txCode
+		p.usageIndexMap[tx.usageIndex] = txMapKey
 		p.usageIndex++
 		return fmt.Sprintf("%v", tx.tx)
 	}
@@ -165,6 +194,7 @@ func (p *ProxyCache) Get(block, txCode string) string {
 		return ""
 	}
 	for p.maxSize > 0 && (p.cachedSize+uint(len(stringRepresentationOfTx)) > p.maxSize) {
+		// TODO would be nice to optimize
 		p.removeLessUsedTx()
 	}
 	p.addTx(stringRepresentationOfTx, resTx)
