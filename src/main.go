@@ -1,69 +1,190 @@
 package main
 
+// get block/0x5bad55/tx/0x8784d99762bccd03b2086eabccee0d77f14d05463281e121a62abfebcf0d2d5f
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 )
 
 const PrintCache = "PRINTCACHE"
+const getBlockByNumber = "eth_getBlockByNumber"
+const getTxByHash = "eth_getTransactionByHash"
 
 type Printer func(...string)
+
+type BlockStructure map[string]interface{}
+
+func (b BlockStructure) getTransactions() []interface{} {
+	return b["transactions"].([]interface{})
+}
+
+func (b BlockStructure) getNumber() string {
+	return b["number"].(string)
+}
+
+type TransactionStructure map[string]interface{}
+
+func (tx TransactionStructure) getHash() string {
+	return tx["hash"].(string)
+}
+
+func (tx TransactionStructure) getTransactionIndex() string {
+	return tx["transactionIndex"].(string)
+}
+
+func (tx TransactionStructure) getBlockNumTransactionIndexKey() string {
+	return tx["blockNumber"].(string) + "-" + tx.getTransactionIndex()
+}
+
+type Payload struct {
+	Jsonrpc string        `json:"jsonrpc"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+	ID      int           `json:"id"`
+}
+
 type Transaction struct {
 	usageIndex uint
-	tx         string // in json format
+	tx         TransactionStructure
 }
 
 type ProxyCache struct {
-	maxTxs        uint
-	cachedTxs     uint
-	maxSize       uint // in bytes
+	client       http.Client
+	debugPrinter Printer
+	maxTxs       uint
+	cachedTxs    uint
+	maxSize      uint // in bytes
+	// assume that data in received JSON is approximately equals to it's string representation length
 	cachedSize    uint // in bytes
-	txMap         map[string] /*hash*/ Transaction
+	txMap         map[string] /*hash or blockHash+index*/ *Transaction
 	usageIndexMap map[uint]string
 	usageIndex    uint
 }
 
+func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (TransactionStructure, error) {
+	res := TransactionStructure{}
+	var method, hash string
+	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending"
+	if callByBlockNumber {
+		method = getBlockByNumber
+		hash = blockNum
+	} else {
+		// TODO switch to getTxByHash, txCode
+		method = getBlockByNumber
+		hash = blockNum
+	}
+	data := Payload{
+		"2.0",
+		method,
+		[]interface{}{hash, true},
+		1,
+	}
+	payloadBytes, err := json.Marshal(data)
+	if err != nil {
+		return res, err
+	}
+	body := bytes.NewReader(payloadBytes)
 
-func (p *ProxyCache) Get(block, txHash string) string {
-	p.debugPrinter("We should get block", block, "transaction", txHash)
-	tx, txCached := p.txMap[txHash]
+	resp, err := p.client.Post("https://cloudflare-eth.com", "application/json", body)
+	if err != nil {
+		return res, err
+	}
+	defer func() {
+		err = resp.Body.Close()
+		if err != nil {
+			fmt.Println("Body Closing error:", err)
+		}
+	}()
+	var result map[string]interface{}
+
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		return res, err
+	}
+
+	errorMessage, errorExist := result["error"]
+	if errorExist {
+		return res, fmt.Errorf("%s", errorMessage)
+	}
+	resultBody, resultExist := result["result"]
+	if !resultExist {
+		return res, fmt.Errorf("%s", "Response does not contain \"result\" field")
+	}
+	if callByBlockNumber {
+		return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
+	} else {
+		return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
+		//return checkTransaction(blockNum, result["result"].(TransactionStructure))
+	}
+
+}
+
+func getTransactionFromBlock(block BlockStructure, txCode string) (TransactionStructure, error) {
+	transactions := block.getTransactions()
+	for _, transaction := range transactions {
+		tx := TransactionStructure(transaction.(map[string]interface{}))
+		if tx.getHash() == txCode /*|| tx.getTransactionIndex() == txCode*/ {
+			return tx, nil
+		}
+	}
+	return TransactionStructure{}, fmt.Errorf("%s %s", "Transaction not found in the block", block.getNumber())
+}
+
+func checkTransaction(blockNum string, tx TransactionStructure) (TransactionStructure, error) {
+	if tx["blockNumber"] == blockNum {
+		return tx, nil
+	}
+	return TransactionStructure{}, fmt.Errorf("transaction %v does not belong to blockNumber %s", tx, blockNum)
+}
+
+func (p *ProxyCache) Get(block, txCode string) string {
+	p.debugPrinter("We should get block", block, "transaction", txCode)
+	tx, txCached := p.txMap[txCode]
 	if txCached {
-		p.debugPrinter("Moving tx", tx.tx, "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
+		p.debugPrinter("Moving tx", fmt.Sprintf("%v", tx.tx), "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
 			"to usageIndex", fmt.Sprintf("%d", p.usageIndex))
 		delete(p.usageIndexMap, tx.usageIndex)
 		tx.usageIndex = p.usageIndex
-		p.usageIndexMap[tx.usageIndex] = txHash
-		p.txMap[txHash] = tx
+		p.usageIndexMap[tx.usageIndex] = txCode
 		p.usageIndex++
-		return tx.tx
+		return fmt.Sprintf("%v", tx.tx)
 	}
-	if p.maxTxs > 0 && uint(len(p.txMap)) == p.maxTxs {
+	if p.maxTxs > 0 && p.cachedTxs == p.maxTxs {
 		p.removeLessUsedTx()
 	}
-	testTx := "This is my test Tx with hash " + txHash
-	for p.maxSize > 0 && (p.cachedSize+uint(len(testTx)) > p.maxSize) {
+	resTx, err := p.sendRequestForTransaction(block, txCode)
+	stringRepresentationOfTx := fmt.Sprintf("%v", resTx)
+	if err != nil {
+		fmt.Println("GET: Error occurred:", err)
+		return ""
+	}
+	for p.maxSize > 0 && (p.cachedSize+uint(len(stringRepresentationOfTx)) > p.maxSize) {
 		p.removeLessUsedTx()
 	}
-	p.addTx(txHash, testTx)
-	return testTx
+	p.addTx(stringRepresentationOfTx, resTx)
+	return stringRepresentationOfTx
 }
 
-func (p *ProxyCache) addTx(txHash, tx string) {
-	if (p.maxSize > 0 && uint(len(tx))+p.cachedSize > p.maxSize) || (p.maxTxs > 0 && p.cachedTxs >= p.maxTxs) {
+func (p *ProxyCache) addTx(stringRepresentationOfTx string, tx TransactionStructure) {
+	if (p.maxSize > 0 && uint(len(stringRepresentationOfTx))+p.cachedSize > p.maxSize) || (p.maxTxs > 0 && p.cachedTxs >= p.maxTxs) {
 		fmt.Println("Max cache size reached, ignoring adding", tx)
 		return
 	}
-	p.usageIndexMap[p.usageIndex] = txHash
-	p.txMap[txHash] = Transaction{
+	p.usageIndexMap[p.usageIndex] = tx.getHash()
+	p.txMap[tx.getHash()] = &Transaction{
 		p.usageIndex,
 		tx,
 	}
-	p.cachedSize += uint(len(tx))
+	p.txMap[tx.getBlockNumTransactionIndexKey()] = p.txMap[tx.getHash()]
+	p.cachedSize += uint(len(stringRepresentationOfTx))
 	p.cachedTxs++
-	p.debugPrinter("Added tx", tx, "with usageIndex", fmt.Sprintf("%d", p.usageIndex))
+	p.debugPrinter("Added tx", stringRepresentationOfTx, "with usageIndex", fmt.Sprintf("%d", p.usageIndex))
 	p.usageIndex++
 }
 
@@ -78,10 +199,12 @@ func (p *ProxyCache) removeLessUsedTx() {
 			minKey = key
 		}
 	}
-	p.cachedSize -= uint(len(p.txMap[p.usageIndexMap[minKey]].tx))
+	p.cachedSize -= uint(len(fmt.Sprintf("%v", p.txMap[p.usageIndexMap[minKey]].tx)))
 	p.cachedTxs--
-	p.debugPrinter("Removing least used tx", p.txMap[p.usageIndexMap[minKey]].tx, "with index", fmt.Sprintf("%d", minKey))
-	delete(p.txMap, p.usageIndexMap[minKey])
+	p.debugPrinter("Removing least used tx", p.usageIndexMap[minKey], "with index", fmt.Sprintf("%d", minKey))
+	tx := p.txMap[p.usageIndexMap[minKey]]
+	delete(p.txMap, tx.tx.getHash())
+	delete(p.txMap, tx.tx.getBlockNumTransactionIndexKey())
 	delete(p.usageIndexMap, minKey)
 }
 
@@ -123,7 +246,7 @@ func (p *ProxyCache) parseInput(input string) (result string, keepHandling bool)
 }
 
 func main() {
-	maxCachedTxsPtr := flag.Uint("b", 0, "Max amount of txs cached by utility, 0 means unlimited")
+	maxCachedTxsPtr := flag.Uint("t", 0, "Max amount of txs cached by utility, 0 means unlimited")
 	maxCacheSizePtr := flag.Uint("s", 0, "Max size of cache in MB, 0 means unlimited")
 	printDebug := flag.Bool("d", false, "Print debug messages")
 	flag.Parse()
@@ -140,13 +263,13 @@ func main() {
 	}
 	reader := bufio.NewReader(os.Stdin)
 	proxyCache := ProxyCache{
-		http.Client{Timeout: 2},
+		http.Client{Timeout: 0},
 		debugPrinter,
 		*maxCachedTxsPtr,
 		0,
 		*maxCacheSizePtr * 1024,
 		0,
-		map[string]Transaction{},
+		map[string]*Transaction{},
 		map[uint]string{},
 		0}
 	for {
