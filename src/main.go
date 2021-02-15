@@ -182,6 +182,9 @@ func (p *ProxyCache) Get(blockNum, txCode string) string {
 		txMapKey = blockNum + "-" + txCode
 	}
 	if tx, txCached := p.txMap[txMapKey]; txCached {
+		if tx.tx.getBlockNum() != blockNum {
+			return fmt.Sprint("GET: Error occurred: transaction ", txCode, " does not belong to blockNum ", blockNum)
+		}
 		p.debugPrinter("Moving tx", fmt.Sprintf("%v", tx.tx), "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
 			"to usageIndex", fmt.Sprintf("%d", p.usageIndex))
 		delete(p.usageIndexMap, tx.usageIndex)
@@ -202,7 +205,9 @@ func (p *ProxyCache) Get(blockNum, txCode string) string {
 		// TODO would be nice to optimize
 		p.removeLessUsedTx()
 	}
-	p.addTx(stringRepresentationOfTx, resTx)
+	if blockNum != "latest" {
+		p.addTx(stringRepresentationOfTx, resTx)
+	}
 	return stringRepresentationOfTx
 }
 
@@ -262,6 +267,11 @@ func clearFromEmptyStrings(input []string) []string {
 }
 
 func (p *ProxyCache) parseInput(input string) (result string, keepHandling bool) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Errorf("got panic: %v", err)
+		}
+	}()
 	input = strings.Replace(input, "\n", "", -1)
 	if strings.Compare(input, "") == 0 {
 		result = "Exiting..."
@@ -270,7 +280,10 @@ func (p *ProxyCache) parseInput(input string) (result string, keepHandling bool)
 	keepHandling = true
 	fmt.Println("->", input)
 	splitInput := clearFromEmptyStrings(strings.Split(input, " "))
-
+	if len(splitInput) == 0 {
+		result = "Received input of spaces, for exit pass empty string"
+		return result, true
+	}
 	switch strings.ToUpper(splitInput[0]) {
 	case "GET":
 		parsedCommand := clearFromEmptyStrings(strings.Split(splitInput[1], "/"))
