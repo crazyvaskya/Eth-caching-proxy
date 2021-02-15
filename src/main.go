@@ -16,6 +16,9 @@ import (
 const PrintCache = "PRINTCACHE"
 const GetBlockByNumber = "eth_getBlockByNumber"
 const GetTxByHash = "eth_getTransactionByHash"
+
+// this might be better to use instead of GetBlockByNumber, but the task asks to get txs them by blockNumber...
+// const GetTransactionByBlockIndex = "eth_getTransactionByBlockNumberAndIndex"
 const MinHashLen = 27 // an assumption that there cannot be too many indices in the block
 
 func isHash(s string) bool {
@@ -82,7 +85,7 @@ func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (Transact
 	res := TransactionStructure{}
 	var method string
 	var params []interface{}
-	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending" || !isHash(txCode)
+	callByBlockNumber := blockNum == "latest" || !isHash(txCode)
 	if callByBlockNumber {
 		method = GetBlockByNumber
 		params = []interface{}{blockNum, true}
@@ -170,13 +173,13 @@ func (p ProxyCache) checkTransaction(blockNum string, tx TransactionStructure) (
 	return TransactionStructure{}, fmt.Errorf("transaction %s does not belong to blockNumber %s", tx.getHash(), blockNum)
 }
 
-func (p *ProxyCache) Get(block, txCode string) string {
-	p.debugPrinter("We should get block", block, "transaction", txCode)
+func (p *ProxyCache) Get(blockNum, txCode string) string {
+	p.debugPrinter("We should get blockNum", blockNum, "transaction", txCode)
 	var txMapKey string
 	if isHash(txCode) {
 		txMapKey = txCode
 	} else { // argument is index
-		txMapKey = block + "-" + txCode
+		txMapKey = blockNum + "-" + txCode
 	}
 	if tx, txCached := p.txMap[txMapKey]; txCached {
 		p.debugPrinter("Moving tx", fmt.Sprintf("%v", tx.tx), "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
@@ -190,7 +193,7 @@ func (p *ProxyCache) Get(block, txCode string) string {
 	if p.maxTxs > 0 && p.cachedTxs == p.maxTxs {
 		p.removeLessUsedTx()
 	}
-	resTx, err := p.sendRequestForTransaction(block, txCode)
+	resTx, err := p.sendRequestForTransaction(blockNum, txCode)
 	if err != nil {
 		return fmt.Sprint("GET: Error occurred: ", err)
 	}
