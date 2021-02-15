@@ -16,7 +16,12 @@ import (
 const PrintCache = "PRINTCACHE"
 const GetBlockByNumber = "eth_getBlockByNumber"
 const GetTxByHash = "eth_getTransactionByHash"
-const MinHashLen = 27
+const MinHashLen = 27 // an assumption that there cannot be too many indices in the block
+
+func isHash(s string) bool {
+	// works for O(1), so we can call it without worrying of efficiency
+	return len(s) >= MinHashLen
+}
 
 type Printer func(...string)
 
@@ -77,7 +82,7 @@ func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (Transact
 	res := TransactionStructure{}
 	var method string
 	var params []interface{}
-	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending" || len(txCode) < MinHashLen
+	callByBlockNumber := blockNum == "latest" || blockNum == "earliest" || blockNum == "pending" || !isHash(txCode)
 	if callByBlockNumber {
 		method = GetBlockByNumber
 		params = []interface{}{blockNum, true}
@@ -122,13 +127,13 @@ func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (Transact
 	if !resultExist {
 		return res, fmt.Errorf("%s", "Response does not contain \"result\" field")
 	}
+	if resultBody == nil {
+		return TransactionStructure{}, fmt.Errorf("%s %s %s %s %s", "Transaction", txCode, "Or block", blockNum, "does not exist")
+	}
 	if callByBlockNumber {
 		return p.getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
 	} else {
 		//return getTransactionFromBlock(resultBody.(map[string]interface{}), txCode)
-		if resultBody == nil {
-			return TransactionStructure{}, fmt.Errorf("%s %s %s", "Transaction", txCode, "does not exist")
-		}
 		return p.checkTransaction(blockNum, resultBody.(map[string]interface{}))
 	}
 
@@ -136,7 +141,7 @@ func (p ProxyCache) sendRequestForTransaction(blockNum, txCode string) (Transact
 
 func (p ProxyCache) getTransactionFromBlock(block BlockStructure, txCode string) (TransactionStructure, error) {
 	transactions := block.getTransactions()
-	if len(txCode) < MinHashLen {
+	if !isHash(txCode) {
 		txIndex := new(big.Int)
 		txIndex.SetString(txCode, 0)
 		if txIndex.IsInt64() && txIndex.Int64() < int64(len(transactions)) {
@@ -167,15 +172,13 @@ func (p ProxyCache) checkTransaction(blockNum string, tx TransactionStructure) (
 
 func (p *ProxyCache) Get(block, txCode string) string {
 	p.debugPrinter("We should get block", block, "transaction", txCode)
-	txHashIsArgument := len(txCode) >= MinHashLen
 	var txMapKey string
-	if txHashIsArgument {
+	if isHash(txCode) {
 		txMapKey = txCode
 	} else { // argument is index
 		txMapKey = block + "-" + txCode
 	}
-	tx, txCached := p.txMap[txMapKey]
-	if txCached {
+	if tx, txCached := p.txMap[txMapKey]; txCached {
 		p.debugPrinter("Moving tx", fmt.Sprintf("%v", tx.tx), "usageIndex", fmt.Sprintf("%d", tx.usageIndex),
 			"to usageIndex", fmt.Sprintf("%d", p.usageIndex))
 		delete(p.usageIndexMap, tx.usageIndex)
@@ -188,11 +191,10 @@ func (p *ProxyCache) Get(block, txCode string) string {
 		p.removeLessUsedTx()
 	}
 	resTx, err := p.sendRequestForTransaction(block, txCode)
-	stringRepresentationOfTx := fmt.Sprintf("%v", resTx)
 	if err != nil {
-		fmt.Println("GET: Error occurred:", err)
-		return ""
+		return fmt.Sprint("GET: Error occurred: ", err)
 	}
+	stringRepresentationOfTx := fmt.Sprintf("%v", resTx)
 	for p.maxSize > 0 && (p.cachedSize+uint(len(stringRepresentationOfTx)) > p.maxSize) {
 		// TODO would be nice to optimize
 		p.removeLessUsedTx()
@@ -246,6 +248,16 @@ func (p ProxyCache) printCache() string {
 		"\nusageIndex: " + fmt.Sprintf("%d", p.usageIndex)
 }
 
+func clearFromEmptyStrings(input []string) []string {
+	output := make([]string, 0, len(input))
+	for _, s := range input {
+		if s != "" {
+			output = append(output, s)
+		}
+	}
+	return output
+}
+
 func (p *ProxyCache) parseInput(input string) (result string, keepHandling bool) {
 	input = strings.Replace(input, "\n", "", -1)
 	if strings.Compare(input, "") == 0 {
@@ -254,19 +266,17 @@ func (p *ProxyCache) parseInput(input string) (result string, keepHandling bool)
 	}
 	keepHandling = true
 	fmt.Println("->", input)
-	splitInput := strings.Split(input, " ")
+	splitInput := clearFromEmptyStrings(strings.Split(input, " "))
 
 	switch strings.ToUpper(splitInput[0]) {
 	case "GET":
-		parsedCommand := strings.Split(splitInput[1], "/")
-		if parsedCommand[0] == "" {
-			parsedCommand = parsedCommand[1:]
-		}
+		parsedCommand := clearFromEmptyStrings(strings.Split(splitInput[1], "/"))
 		if len(parsedCommand) != 4 || strings.ToLower(parsedCommand[0]) != "block" || strings.ToLower(parsedCommand[2]) != "tx" {
 			result = "received incorrect input: " +
-				fmt.Sprintf("%v", parsedCommand) + " usage: /block/<>/tx/<>"
+				fmt.Sprintf("%v", splitInput[1]) + " usage: /block/<>/tx/<>"
+		} else {
+			result = p.Get(parsedCommand[1], parsedCommand[3])
 		}
-		result = p.Get(parsedCommand[1], parsedCommand[3])
 	case PrintCache:
 		result = p.printCache()
 	default:
@@ -287,6 +297,7 @@ func main() {
 	fmt.Println("---", PrintCache)
 
 	debugPrinter := func(s ...string) {
+		// works a bit nasty, but seems fine for debugging
 		if *printDebug {
 			fmt.Println("DEBUG: ", s)
 		}
@@ -306,7 +317,7 @@ func main() {
 		input, _ := reader.ReadString('\n')
 		result, keepHandling := proxyCache.parseInput(input)
 		fmt.Println(result)
-		if !keepHandling { // logging is inside
+		if !keepHandling {
 			break
 		}
 	}
